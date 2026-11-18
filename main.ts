@@ -1,12 +1,14 @@
 import { BPS, runBars, type Bar, type BarsState, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
 
-const FAST = 8;
-const SLOW = 21;
-const ROC = 12;
+const FAST = 12;
+const SLOW = 60;
+const ROC = 60;
 const ATR = 14;
-const ENTRY_GAP_BPS = 18;
-const EXIT_GAP_BPS = 8;
-const TRAIL_BPS = 85;
+const ENTRY_GAP_BPS = 6n;
+const EXIT_GAP_BPS = 8n;
+const TRAIL_BPS = 65n;
+const ENTRY_ROC_BPS = 30n;
+const TAKE_PROFIT_BPS = 125n;
 const MAX_SLIPPAGE_BPS = 250;
 
 interface Series {
@@ -16,13 +18,14 @@ interface Series {
   prevClose: bigint | null;
   tr: bigint[];
   peak: bigint;
+  nextEntry: number;
 }
 const series = new Map<string, Series>();
 
 function getSeries(symbol: string): Series {
   let s = series.get(symbol);
   if (s === undefined) {
-    s = { closes: [], fast: null, slow: null, prevClose: null, tr: [], peak: 0n };
+    s = { closes: [], fast: null, slow: null, prevClose: null, tr: [], peak: 0n, nextEntry: 0 };
     series.set(symbol, s);
   }
   return s;
@@ -87,13 +90,18 @@ await runBars({
     if (held !== undefined) {
       const cost = held.cost;
       const value = state.value(symbol, held.qty);
-      const trail = s.peak > 0n && close * BPS < s.peak * BigInt(BPS - TRAIL_BPS);
-      const weak = !momentum && gapBps <= BigInt(EXIT_GAP_BPS) && close + atr / 2n < s.slow;
-      const loss = value * 995n < cost * 1000n;
-      if (trail || weak || loss) return [{ side: 'sell', symbol, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS } satisfies SellInput];
+      const trail = s.peak > 0n && close * BPS < s.peak * (BPS - TRAIL_BPS);
+      const weak = !momentum && gapBps <= EXIT_GAP_BPS && close + atr / 2n < s.slow;
+      const loss = value * 1000n < cost * 980n;
+      const profit = value * BPS >= cost * (BPS + TAKE_PROFIT_BPS);
+      if (trail || weak || loss || profit) {
+        s.nextEntry = state.seq + 720;
+        return [{ side: 'sell', symbol, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS } satisfies SellInput];
+      }
       return [];
     }
-    if (momentum && gapBps >= BigInt(ENTRY_GAP_BPS) && close > s.slow + atr / 3n) {
+    s.peak = close;
+    if (state.seq >= s.nextEntry && close * BPS > s.closes[s.closes.length - 1 - ROC]! * (BPS + ENTRY_ROC_BPS) && gapBps >= ENTRY_GAP_BPS && close > s.slow + atr / 3n) {
       const order = buyOrder(state, symbol);
       return order === null ? [] : [order];
     }
