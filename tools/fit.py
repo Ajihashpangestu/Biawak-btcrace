@@ -35,6 +35,51 @@ def sell(qty, price, depth, scale):
     return gross * (BPS - FEE) // BPS
 
 
+def replay(bars, scale, orders):
+    """Replay one CBBTC position and at most one order per decision."""
+    cash, qty, fills = START, 0, 0
+    peak, drawdown = START, 0.0
+    decisions = {}
+    for order in orders:
+        i = order["bar"]
+        if not 0 <= i < len(bars) - 1 or i in decisions:
+            raise ValueError(f"unavailable decision batch: {i}")
+        decisions[i] = order
+    for i, bar in enumerate(bars[1:]):
+        order = decisions.get(i)
+        if order is not None:
+            amount = int(order["amount"])
+            p, d = int(bar["o"]), int(bar["o_depth"][0])
+            close = int(bars[i]["c"])
+            if order["side"] == "buy":
+                if not MIN_NOTIONAL <= amount <= cash:
+                    raise ValueError(f"invalid buy size at batch {i}")
+                received, price = buy(amount, p, d, scale)
+                if not received or price > 2 * close:
+                    raise ValueError(f"invalid buy fill at batch {i}")
+                cash -= amount
+                qty += received
+            elif order["side"] == "sell":
+                if not 0 < amount <= qty or (
+                    amount != qty and amount * close // scale < MIN_NOTIONAL
+                ):
+                    raise ValueError(f"invalid sell size at batch {i}")
+                cash += sell(amount, p, d, scale)
+                qty -= amount
+            else:
+                raise ValueError(f"unknown side at batch {i}")
+            fills += 1
+        equity = cash + qty * int(bar["c"]) // scale
+        peak = max(peak, equity)
+        drawdown = max(drawdown, (peak - equity) / peak)
+    forced_close = qty != 0
+    if forced_close:
+        cash += sell(qty, int(bars[-1]["c"]), int(bars[-1]["c_depth"][0]), scale)
+    return {"cash": cash, "pnl": cash - START, "fills": fills,
+            "forced_close": forced_close,
+            "drawdown": max(drawdown, (peak - cash) / peak)}
+
+
 def split_bps(capital, markets, side):
     # Approximate each fill's return as a quadratic in its share of the leg.
     # Equalize marginal returns, with bounds to keep every bar participating.
@@ -119,7 +164,8 @@ def fit(bars, scale, *, consecutive=False):
             for i, (offset, bps) in enumerate(sells):
                 market = markets[offset]
                 chunk = remaining if i == len(sells) - 1 else qty * bps // BPS
-                if chunk * min(market[0], closes[bar + offset]) // scale < MIN_NOTIONAL:
+                if chunk <= 0 or (chunk != remaining and
+                                 chunk * closes[bar + offset] // scale < MIN_NOTIONAL):
                     break
                 proceeds += sell(chunk, *market, scale)
                 remaining -= chunk
@@ -129,12 +175,20 @@ def fit(bars, scale, *, consecutive=False):
                     cash[done] = proceeds
                     paths[done] = (previous, entry, bar, entry_bps, sells, invested, proceeds)
 
+    final_cash, path = cash[-1], paths[-1]
+    final_price, final_depth = closes[-1], int(bars[-1]["c_depth"][0])
+    for long in positions.values():
+        if long[-1]:
+            qty, entry, buys, invested, previous = long[-1]
+            proceeds = sell(qty, final_price, final_depth, scale)
+            if proceeds > final_cash:
+                final_cash = proceeds
+                path = (previous, entry, len(bars) - 1, buys, (), invested, proceeds)
     trades = []
-    path = paths[-1]
     while path is not None:
         path, entry, exit_bar, buys, sells, invested, received = path
         trades.append((entry, exit_bar, buys, sells, invested, received))
-    return cash[-1], trades[::-1]
+    return final_cash, trades[::-1]
 
 
 def usdc(units):
